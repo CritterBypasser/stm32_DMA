@@ -1,0 +1,157 @@
+#include "stm32f4xx.h"
+
+#define BUFFER_SIZE     1
+#define UART_BAUD       57600
+#define SYSCLK_HZ       16000000UL   // HSI
+#define TIMER_FREQ_HZ   100
+
+volatile uint16_t adcBuffer[BUFFER_SIZE];
+volatile uint8_t dmaComplete = 0;
+
+void SystemClock_Config(void);
+void UART_Init(void);
+void UART_SendChar(char c);
+void UART_SendString(const char *s);
+void UART_SendNumber(uint32_t n);
+void TIM2_Init(void);
+void ADC_DMA_Init(void);
+
+int main(void)
+{
+    SystemClock_Config();
+
+    UART_Init();
+    ADC_DMA_Init();
+    TIM2_Init();
+
+    UART_SendString("\r\nSTM32F401CC ADC + DMA + UART\r\n");
+    UART_SendString("Baud: 57600\r\n");
+    UART_SendString("Sample Rate: 100 Hz\r\n");
+    UART_SendString("-----------------------------------\r\n");
+
+    TIM2->CR1 |= TIM_CR1_CEN;   // start timer
+
+    while (1)
+    {
+        if (dmaComplete)
+        {
+            dmaComplete = 0;
+
+            uint32_t adc = adcBuffer[0];
+            uint32_t mv = (adc * 3300UL) / 4095UL;
+
+            UART_SendString("ADC: ");
+            UART_SendNumber(adc);
+            UART_SendString(" | Voltage: ");
+            UART_SendNumber(mv / 1000);
+            UART_SendString(".");
+            UART_SendNumber((mv % 1000) / 100);
+            UART_SendNumber((mv % 100) / 10);
+            UART_SendNumber(mv % 10);
+            UART_SendString(" V\r\n");
+        }
+    }
+}
+
+void SystemClock_Config(void)
+{
+    RCC->CR |= RCC_CR_HSION;
+    while (!(RCC->CR & RCC_CR_HSIRDY));
+
+    RCC->CFGR = 0;   // HSI as SYSCLK
+}
+
+void UART_Init(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
+
+    GPIOA->MODER &= ~(GPIO_MODER_MODER2);
+    GPIOA->MODER |=  (2 << GPIO_MODER_MODER2_Pos);   // AF
+
+    GPIOA->AFR[0] |= (7 << GPIO_AFRL_AFSEL2_Pos);    // AF7
+
+    USART2->BRR = SYSCLK_HZ / UART_BAUD;
+    USART2->CR1 = USART_CR1_TE | USART_CR1_UE;
+}
+
+void UART_SendChar(char c)
+{
+    while (!(USART2->SR & USART_SR_TXE));
+    USART2->DR = c;
+}
+
+void UART_SendString(const char *s)
+{
+    while (*s) UART_SendChar(*s++);
+}
+
+void UART_SendNumber(uint32_t n)
+{
+    char buf[10];
+    int i = 0;
+
+    if (n == 0) { UART_SendChar('0'); return; }
+
+    while (n) { buf[i++] = '0' + (n % 10); n /= 10; }
+    while (i--) UART_SendChar(buf[i]);
+}
+
+void TIM2_Init(void)
+{
+    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+
+    TIM2->PSC = 16000 - 1;   // 16 MHz → 1 kHz
+    TIM2->ARR = 10 - 1;      // 1 kHz → 100 Hz
+
+    TIM2->CR2 |= (2 << TIM_CR2_MMS_Pos);  // TRGO on update
+    TIM2->EGR |= TIM_EGR_UG;
+}
+
+void ADC_DMA_Init(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_DMA2EN;
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
+
+    GPIOA->MODER |= (3 << GPIO_MODER_MODER0_Pos); // PA0 analog
+
+    DMA2_Stream0->CR = 0;
+    while (DMA2_Stream0->CR & DMA_SxCR_EN);
+
+    DMA2->LIFCR = 0x3D;
+
+    DMA2_Stream0->PAR  = (uint32_t)&ADC1->DR;
+    DMA2_Stream0->M0AR = (uint32_t)adcBuffer;
+    DMA2_Stream0->NDTR = BUFFER_SIZE;
+
+    DMA2_Stream0->CR =
+        (1 << DMA_SxCR_MSIZE_Pos) |
+        (1 << DMA_SxCR_PSIZE_Pos) |
+        DMA_SxCR_CIRC |
+        DMA_SxCR_TCIE;
+
+    NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+    DMA2_Stream0->CR |= DMA_SxCR_EN;
+
+    ADC->CCR = (1 << ADC_CCR_ADCPRE_Pos);  // PCLK2/4
+
+    ADC1->CR2 =
+        ADC_CR2_DMA |
+        ADC_CR2_DDS |
+        (6 << ADC_CR2_EXTSEL_Pos) |
+        (1 << ADC_CR2_EXTEN_Pos);
+
+    ADC1->SMPR2 = (5 << ADC_SMPR2_SMP0_Pos);
+    ADC1->SQR3  = 0;
+
+    ADC1->CR2 |= ADC_CR2_ADON;
+}
+
+void DMA2_Stream0_IRQHandler(void)
+{
+    if (DMA2->LISR & DMA_LISR_TCIF0)
+    {
+        DMA2->LIFCR = DMA_LIFCR_CTCIF0;
+        dmaComplete = 1;
+    }
+}
